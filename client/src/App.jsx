@@ -11,7 +11,7 @@ import {
 } from "react-router-dom";
 import "./App.css";
 
-const API_URL = "http://localhost:5000/api";
+const API_URL = "https://event-sphere-k1h6t869v-karthik9724s-projects.vercel.app/api";
 const SERVER_URL = API_URL.replace(/\/api$/, "");
 
 const STUDENT_STORAGE = "eventsphere_student";
