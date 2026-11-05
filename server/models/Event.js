@@ -55,6 +55,12 @@ const eventSchema = new mongoose.Schema(
       default: ""
     },
 
+    // Cloudinary image ID for deleting images
+    imagePublicId: {
+      type: String,
+      default: ""
+    },
+
     coordinatorPhone: {
       type: String,
       required: true,

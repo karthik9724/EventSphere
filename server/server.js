@@ -1,3 +1,4 @@
+
 const express = require("express");
 const cors = require("cors");
 const mongoose = require("mongoose");
@@ -5,14 +6,26 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const dotenv = require("dotenv");
 const multer = require("multer");
-const fs = require("fs");
-const path = require("path");
-const crypto = require("crypto");
+const cloudinary = require("cloudinary").v2;
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+
+// ==================================================
+// CLOUDINARY CONFIGURATION
+// ==================================================
+
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET
+});
+
+// ==================================================
+// EXPRESS CONFIGURATION
+// ==================================================
 
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
@@ -159,29 +172,13 @@ const EventRegistration =
   mongoose.model("EventRegistration", registrationSchema);
 
 // ==================================================
-// IMAGE UPLOAD CONFIGURATION
+// CLOUDINARY IMAGE UPLOAD CONFIGURATION
 // ==================================================
 
-const uploadDirectory = path.join(__dirname, "uploads");
+// Store uploaded image temporarily in memory.
+// The image will be sent directly to Cloudinary.
 
-fs.mkdirSync(uploadDirectory, { recursive: true });
-
-app.use("/uploads", express.static(uploadDirectory));
-
-const storage = multer.diskStorage({
-  destination: (req, file, callback) => {
-    callback(null, uploadDirectory);
-  },
-
-  filename: (req, file, callback) => {
-    const extension = path.extname(file.originalname).toLowerCase();
-
-    const filename =
-      `${Date.now()}-${crypto.randomBytes(8).toString("hex")}${extension}`;
-
-    callback(null, filename);
-  }
-});
+const storage = multer.memoryStorage();
 
 const upload = multer({
   storage,
@@ -206,6 +203,8 @@ const upload = multer({
   }
 });
 
+// Handle image upload errors.
+
 function uploadEventImage(req, res, next) {
   upload.single("image")(req, res, error => {
     if (error) {
@@ -219,13 +218,35 @@ function uploadEventImage(req, res, next) {
   });
 }
 
-function removeUploadedImage(file) {
-  if (!file) return;
+// Upload image buffer to Cloudinary.
 
-  fs.unlink(file.path, error => {
-    if (error) {
-      console.error("Image cleanup error:", error.message);
-    }
+function uploadToCloudinary(fileBuffer) {
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(
+      {
+        folder: "eventsphere/events",
+        resource_type: "image"
+      },
+      (error, result) => {
+        if (error) {
+          return reject(error);
+        }
+
+        resolve(result);
+      }
+    );
+
+    stream.end(fileBuffer);
+  });
+}
+
+// Delete image from Cloudinary.
+
+async function deleteCloudinaryImage(publicId) {
+  if (!publicId) return;
+
+  return cloudinary.uploader.destroy(publicId, {
+    resource_type: "image"
   });
 }
 
@@ -651,7 +672,7 @@ app.post("/api/admin/login", async (req, res) => {
 });
 
 // ==================================================
-// COORDINATOR: CREATE EVENT WITH IMAGE
+// COORDINATOR: CREATE EVENT WITH CLOUDINARY IMAGE
 // ==================================================
 
 app.post(
@@ -659,6 +680,8 @@ app.post(
   authenticateCoordinator,
   uploadEventImage,
   async (req, res) => {
+    let uploadedImage = null;
+
     try {
       if (!req.file) {
         return res.status(400).json({
@@ -687,8 +710,6 @@ app.post(
         !organizer ||
         !maxCapacity
       ) {
-        removeUploadedImage(req.file);
-
         return res.status(400).json({
           success: false,
           message: "Please fill in all required event details."
@@ -698,8 +719,6 @@ app.post(
       const maximum = Number(maxCapacity);
 
       if (!Number.isInteger(maximum) || maximum < 1) {
-        removeUploadedImage(req.file);
-
         return res.status(400).json({
           success: false,
           message: "Maximum capacity must be a valid number greater than zero."
@@ -709,14 +728,16 @@ app.post(
       const phone = normalizePhoneNumber(coordinatorPhone);
 
       if (!phone || !isValidPhoneNumber(phone)) {
-        removeUploadedImage(req.file);
-
         return res.status(400).json({
           success: false,
           message: "Please provide a valid coordinator phone number."
         });
       }
 
+      // Upload image to Cloudinary.
+      uploadedImage = await uploadToCloudinary(req.file.buffer);
+
+      // Save event details and Cloudinary image information in MongoDB.
       const event = await Event.create({
         title: title.trim(),
         description: description.trim(),
@@ -726,7 +747,8 @@ app.post(
         organizer: organizer.trim(),
         maxCapacity: maximum,
         registeredCount: 0,
-        imageUrl: `/uploads/${req.file.filename}`,
+        imageUrl: uploadedImage.secure_url,
+        imagePublicId: uploadedImage.public_id,
         coordinatorPhone: phone,
         createdBy: req.user.id,
         status: "Pending"
@@ -738,7 +760,19 @@ app.post(
         event
       });
     } catch (error) {
-      removeUploadedImage(req.file);
+      // If MongoDB saving fails after Cloudinary upload,
+      // delete the uploaded image to avoid unused files.
+
+      if (uploadedImage?.public_id) {
+        try {
+          await deleteCloudinaryImage(uploadedImage.public_id);
+        } catch (cleanupError) {
+          console.error(
+            "Cloudinary cleanup error:",
+            cleanupError.message
+          );
+        }
+      }
 
       console.error("Create event error:", error);
 
@@ -909,17 +943,15 @@ app.delete(
         });
       }
 
-      if (deletedEvent.imageUrl?.startsWith("/uploads/")) {
-        const filename = path.basename(deletedEvent.imageUrl);
-        const imagePath = path.resolve(uploadDirectory, filename);
-        const safeDirectory = path.resolve(uploadDirectory);
-
-        if (imagePath.startsWith(safeDirectory + path.sep)) {
-          fs.unlink(imagePath, error => {
-            if (error && error.code !== "ENOENT") {
-              console.error("Deleted event image cleanup error:", error.message);
-            }
-          });
+      // Delete the associated image from Cloudinary.
+      if (deletedEvent.imagePublicId) {
+        try {
+          await deleteCloudinaryImage(deletedEvent.imagePublicId);
+        } catch (imageError) {
+          console.error(
+            "Cloudinary event image deletion error:",
+            imageError.message
+          );
         }
       }
 
@@ -1440,7 +1472,6 @@ app.delete(
           throw error;
         }
 
-        // Find the event to check the cancellation deadline.
         const event = await Event.findById(registration.event).session(session);
 
         if (!event) {
@@ -1569,7 +1600,6 @@ app.delete(
           throw error;
         }
 
-        // Find the event to check the cancellation deadline.
         const event = await Event.findById(registration.event).session(session);
 
         if (!event) {
@@ -1881,7 +1911,10 @@ async function startServer() {
       !process.env.MONGODB_URI ||
       !process.env.ADMIN_EMAIL ||
       !process.env.ADMIN_PASSWORD ||
-      !process.env.JWT_SECRET
+      !process.env.JWT_SECRET ||
+      !process.env.CLOUDINARY_CLOUD_NAME ||
+      !process.env.CLOUDINARY_API_KEY ||
+      !process.env.CLOUDINARY_API_SECRET
     ) {
       throw new Error(
         "Missing required environment variables. Check your .env file."
@@ -1896,7 +1929,7 @@ async function startServer() {
 
     app.listen(PORT, () => {
       console.log(`EventSphere server running on port ${PORT}`);
-      console.log(`Image uploads: http://localhost:${PORT}/uploads`);
+      console.log("Cloudinary image storage is configured.");
     });
   } catch (error) {
     console.error("Server startup error:", error.message);
